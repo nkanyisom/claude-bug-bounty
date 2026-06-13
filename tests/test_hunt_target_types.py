@@ -62,11 +62,19 @@ def test_run_recon_rejects_large_cidr_before_spawning(monkeypatch):
 
 
 def test_recon_engine_expands_cidr_when_nmap_is_unavailable():
-    recon_engine = (Path(__file__).resolve().parents[1] / "tools" / "recon_engine.sh").read_text()
+    recon_engine = (
+        Path(__file__).resolve().parents[1] / "tools" / "recon_engine.sh"
+    ).read_text()
 
     assert "_expand_cidr_hosts" in recon_engine
-    assert 'log_warn "nmap not installed — expanding the CIDR locally for downstream probing"' in recon_engine
-    assert 'log_warn "nmap did not identify live hosts — expanding the CIDR locally for downstream probing"' in recon_engine
+    assert (
+        'log_warn "nmap not installed — expanding the CIDR locally for downstream probing"'
+        in recon_engine
+    )
+    assert (
+        'log_warn "nmap did not identify live hosts — expanding the CIDR locally for downstream probing"'
+        in recon_engine
+    )
 
 
 def test_detect_target_type_list(tmp_path):
@@ -74,6 +82,35 @@ def test_detect_target_type_list(tmp_path):
     list_file = tmp_path / "scope.txt"
     list_file.write_text("api.example.com\nshop.example.com\n")
     assert hunt.detect_target_type(str(list_file)) == "list"
+
+
+def test_normalize_vuln_scope_supports_aliases_and_all():
+    hunt = load_hunt_module()
+
+    assert hunt.normalize_vuln_scope("XSS, sqli, upload") == ["xss", "sqli", "upload"]
+    assert hunt.normalize_vuln_scope("all") is None
+
+
+def test_normalize_vuln_scope_rejects_unknown_scope():
+    hunt = load_hunt_module()
+
+    try:
+        hunt.normalize_vuln_scope("xss, magic")
+    except ValueError as exc:
+        assert "Unsupported vulnerability scope" in str(exc)
+    else:
+        raise AssertionError("expected unsupported vulnerability scope to be rejected")
+
+
+def test_normalize_user_agent_rejects_newlines():
+    hunt = load_hunt_module()
+
+    try:
+        hunt._normalize_user_agent("hunt\nagent")
+    except ValueError as exc:
+        assert "newlines" in str(exc)
+    else:
+        raise AssertionError("expected newline-containing user-agent to be rejected")
 
 
 def test_run_recon_skips_for_empty_list(tmp_path, monkeypatch):
@@ -96,6 +133,8 @@ def test_run_recon_skips_for_empty_list(tmp_path, monkeypatch):
 
 
 def test_recon_engine_handles_domain_list_mode():
-    recon_engine = (Path(__file__).resolve().parents[1] / "tools" / "recon_engine.sh").read_text()
+    recon_engine = (
+        Path(__file__).resolve().parents[1] / "tools" / "recon_engine.sh"
+    ).read_text()
     assert 'TARGET_TYPE="list"' in recon_engine
-    assert 'Domain-list target' in recon_engine
+    assert "Domain-list target" in recon_engine

@@ -17,11 +17,14 @@ python3 tools/hunt.py --target target.com
 
 # Quick mode (fewer checks, faster):
 python3 tools/hunt.py --target target.com --quick
+
+# Optional: limit hunting to selected vuln classes and set a custom User-Agent:
+python3 tools/hunt.py --target target.com --vulns xss,sqli --user-agent "MyReconBot/1.0"
 ```
 
 That's it. The script:
 1. Reads `recon/<target>/` (subdomains, live hosts, URLs, gf-classified candidates).
-2. Runs `tools/vuln_scanner.sh recon/<target>/` — XSS (dalfox), SQLi (linear-scaling verifier), SSTI math-canary probes, race conditions, RCE PoC, MFA/SAML checks.
+2. Runs `tools/vuln_scanner.sh recon/<target>/` — XSS (dalfox), SQLi (linear-scaling verifier), SSTI math-canary probes, upload/RCE PoC, MFA, CMS, and SAML checks. If `--vulns` is set, only the selected classes are scanned.
 3. Writes results to `findings/<target>/` with a `summary.txt`.
 
 Output you should see (not a loop):

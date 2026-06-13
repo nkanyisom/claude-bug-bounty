@@ -20,6 +20,7 @@ import itertools
 import ipaddress
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,7 +29,11 @@ from datetime import datetime
 # Auth session is bundled into the package; importable when run as a script
 # because tools/__init__.py is present.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tools.auth_session import AuthSession, add_cli_args, session_from_args  # noqa: E402
+from tools.auth_session import (
+    AuthSession,
+    add_cli_args,
+    session_from_args,
+)  # noqa: E402
 from tools.banner import print_banner  # noqa: E402
 
 # Process-wide AuthSession. Populated in main() once flags are parsed and
@@ -36,6 +41,28 @@ from tools.banner import print_banner  # noqa: E402
 # session env vars. (Plain assignment — kept 3.9-compatible; the codebase
 # elsewhere uses 3.10+ union syntax but hunt.py historically did not.)
 _AUTH_SESSION = None
+
+SUPPORTED_VULN_SCOPES = ("upload", "sqli", "xss", "ssti", "cms", "mfa", "saml")
+VULN_SCOPE_ALIASES = {
+    "upload": "upload",
+    "uploads": "upload",
+    "fileupload": "upload",
+    "file_upload": "upload",
+    "rce": "upload",
+    "sqli": "sqli",
+    "sql": "sqli",
+    "xss": "xss",
+    "ssti": "ssti",
+    "cms": "cms",
+    "wordpress": "cms",
+    "drupal": "cms",
+    "mfa": "mfa",
+    "2fa": "mfa",
+    "otp": "mfa",
+    "saml": "saml",
+    "sso": "saml",
+    "all": "all",
+}
 
 
 def _normalize_argv(argv):
@@ -46,9 +73,69 @@ def _normalize_argv(argv):
     return ["--help" if item == "-help" else item for item in argv]
 
 
+def _normalize_user_agent(user_agent):
+    if user_agent is None:
+        return None
+    user_agent = user_agent.strip()
+    if not user_agent:
+        return None
+    if "\r" in user_agent or "\n" in user_agent:
+        raise ValueError("user-agent cannot contain newlines")
+    return user_agent
+
+
+def normalize_vuln_scope(scope_value):
+    if scope_value is None:
+        return None
+
+    if isinstance(scope_value, str):
+        raw_values = scope_value.split(",")
+    else:
+        raw_values = list(scope_value)
+
+    normalized = []
+    seen = set()
+
+    for raw_value in raw_values:
+        token = raw_value.strip().lower().replace("-", "_")
+        token = re.sub(r"\s+", "", token)
+        if not token:
+            continue
+
+        canonical = VULN_SCOPE_ALIASES.get(token, token)
+        if canonical == "all":
+            return None
+        if canonical not in SUPPORTED_VULN_SCOPES:
+            raise ValueError(f"Unsupported vulnerability scope: {raw_value.strip()}")
+        if canonical not in seen:
+            seen.add(canonical)
+            normalized.append(canonical)
+
+    return normalized or None
+
+
+def _build_child_env(user_agent=None):
+    child_env = os.environ.copy()
+    if _AUTH_SESSION is not None:
+        _AUTH_SESSION.export_to_env(child_env)
+        if not _AUTH_SESSION.is_empty():
+            log("info", _AUTH_SESSION.describe())
+
+    normalized_user_agent = _normalize_user_agent(user_agent)
+    if normalized_user_agent:
+        header_line = f"User-Agent: {normalized_user_agent}"
+        existing_headers = child_env.get("BBHUNT_AUTH_HEADERS", "")
+        child_env["BBHUNT_AUTH_HEADERS"] = (
+            f"{existing_headers}\n{header_line}" if existing_headers else header_line
+        )
+
+    return child_env
+
+
 # ── Target type detection (FQDN / single IP / CIDR) ──────────────────────────
 
 MAX_CIDR_HOSTS = 254
+
 
 def detect_target_type(target: str) -> str:
     """Return 'list', 'cidr', 'ip', or 'domain'.
@@ -79,6 +166,7 @@ def expand_cidr(cidr: str, max_hosts: int = MAX_CIDR_HOSTS) -> list[str]:
     if not hosts:
         return [str(net.network_address)]
     return hosts
+
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(TOOLS_DIR)
@@ -113,8 +201,13 @@ def run_cmd(cmd, cwd=None, timeout=600):
     proc = None
     try:
         proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=cwd, preexec_fn=os.setsid,
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=cwd,
+            preexec_fn=os.setsid,
         )
         stdout, _ = proc.communicate(timeout=timeout)
         return proc.returncode == 0, stdout or ""
@@ -138,7 +231,17 @@ def run_cmd(cmd, cwd=None, timeout=600):
 
 def check_tools():
     """Check which tools are installed."""
-    tools = ["subfinder", "httpx", "nuclei", "ffuf", "nmap", "amass", "gau", "dalfox", "subjack"]
+    tools = [
+        "subfinder",
+        "httpx",
+        "nuclei",
+        "ffuf",
+        "nmap",
+        "amass",
+        "gau",
+        "dalfox",
+        "subjack",
+    ]
     installed = []
     missing = []
 
@@ -184,10 +287,7 @@ def select_targets(top_n=10):
     """Run target selector."""
     log("info", "Running target selector...")
     script = os.path.join(TOOLS_DIR, "target_selector.py")
-    success, output = run_cmd(
-        f'python3 "{script}" --top {top_n}',
-        timeout=60
-    )
+    success, output = run_cmd(f'python3 "{script}" --top {top_n}', timeout=60)
     print(output)
 
     if not success:
@@ -204,7 +304,7 @@ def select_targets(top_n=10):
     return []
 
 
-def run_recon(domain, quick=False, scope_lock=False):
+def run_recon(domain, quick=False, scope_lock=False, user_agent=None):
     """Run recon engine on a domain, single IP, or CIDR range."""
     log("info", f"Running recon on {domain}...")
     script = os.path.join(TOOLS_DIR, "recon_engine.sh")
@@ -226,7 +326,8 @@ def run_recon(domain, quick=False, scope_lock=False):
             try:
                 with open(domain, "r", encoding="utf-8") as f:
                     n = sum(
-                        1 for line in f
+                        1
+                        for line in f
                         if line.strip() and not line.lstrip().startswith("#")
                     )
             except OSError as exc:
@@ -237,21 +338,19 @@ def run_recon(domain, quick=False, scope_lock=False):
                 return False
             log("info", f"Domain list {domain} → {n} host(s) to scan")
 
-    scope_env  = "SCOPE_LOCK=1 " if scope_lock else ""
-    type_env   = f'TARGET_TYPE="{target_type}" '
+    scope_env = "SCOPE_LOCK=1 " if scope_lock else ""
+    type_env = f'TARGET_TYPE="{target_type}" '
 
-    # Inject auth env vars (if any) so the bash helper picks them up.
-    child_env = os.environ.copy()
-    if _AUTH_SESSION is not None:
-        _AUTH_SESSION.export_to_env(child_env)
-        if not _AUTH_SESSION.is_empty():
-            log("info", _AUTH_SESSION.describe())
+    # Inject auth and optional user-agent env vars so the bash helper picks them up.
+    child_env = _build_child_env(user_agent=user_agent)
 
     # Run with live output
     try:
         proc = subprocess.Popen(
             f'{scope_env}{type_env}bash "{script}" "{domain}" {quick_flag}',
-            shell=True, cwd=BASE_DIR, env=child_env,
+            shell=True,
+            cwd=BASE_DIR,
+            env=child_env,
         )
         proc.wait(timeout=3600)  # 60 min timeout (CIDR ranges can be large)
         return proc.returncode == 0
@@ -276,7 +375,7 @@ def check_cicd_results(domain):
                     log("warn", f"CI/CD findings detected — review: {summary_path}")
 
 
-def run_vuln_scan(domain, quick=False):
+def run_vuln_scan(domain, quick=False, vuln_scope=None, user_agent=None):
     """Run vulnerability scanner on recon results."""
     recon_dir = os.path.join(RECON_DIR, domain)
     if not os.path.isdir(recon_dir):
@@ -286,15 +385,16 @@ def run_vuln_scan(domain, quick=False):
     log("info", f"Running vulnerability scanner on {domain}...")
     script = os.path.join(TOOLS_DIR, "vuln_scanner.sh")
     quick_flag = "--quick" if quick else ""
+    scope_flag = f"--only {','.join(vuln_scope)}" if vuln_scope else ""
 
-    child_env = os.environ.copy()
-    if _AUTH_SESSION is not None:
-        _AUTH_SESSION.export_to_env(child_env)
+    child_env = _build_child_env(user_agent=user_agent)
 
     try:
         proc = subprocess.Popen(
-            f'bash "{script}" "{recon_dir}" {quick_flag}',
-            shell=True, cwd=BASE_DIR, env=child_env,
+            f'bash "{script}" "{recon_dir}" {quick_flag} {scope_flag}',
+            shell=True,
+            cwd=BASE_DIR,
+            env=child_env,
         )
         proc.wait(timeout=1800)
         return proc.returncode == 0
@@ -306,7 +406,10 @@ def run_vuln_scan(domain, quick=False):
 
 def generate_reports(domain):
     """Generate reports for findings."""
-    log("warn", "report_generator.py has been removed. Use /report in Claude Code to generate reports.")
+    log(
+        "warn",
+        "report_generator.py has been removed. Use /report in Claude Code to generate reports.",
+    )
     return 0
 
 
@@ -333,7 +436,11 @@ def show_status():
 
     # Check recon results
     if os.path.isdir(RECON_DIR):
-        recon_targets = [d for d in os.listdir(RECON_DIR) if os.path.isdir(os.path.join(RECON_DIR, d))]
+        recon_targets = [
+            d
+            for d in os.listdir(RECON_DIR)
+            if os.path.isdir(os.path.join(RECON_DIR, d))
+        ]
         print(f"  Recon completed: {len(recon_targets)} targets")
         for t in recon_targets:
             subs_file = os.path.join(RECON_DIR, t, "subdomains", "all.txt")
@@ -344,7 +451,11 @@ def show_status():
 
     # Check findings
     if os.path.isdir(FINDINGS_DIR):
-        finding_targets = [d for d in os.listdir(FINDINGS_DIR) if os.path.isdir(os.path.join(FINDINGS_DIR, d))]
+        finding_targets = [
+            d
+            for d in os.listdir(FINDINGS_DIR)
+            if os.path.isdir(os.path.join(FINDINGS_DIR, d))
+        ]
         print(f"  Scanned targets: {len(finding_targets)}")
         for t in finding_targets:
             summary = os.path.join(FINDINGS_DIR, t, "summary.txt")
@@ -358,10 +469,18 @@ def show_status():
 
     # Check reports
     if os.path.isdir(REPORTS_DIR):
-        report_targets = [d for d in os.listdir(REPORTS_DIR) if os.path.isdir(os.path.join(REPORTS_DIR, d))]
+        report_targets = [
+            d
+            for d in os.listdir(REPORTS_DIR)
+            if os.path.isdir(os.path.join(REPORTS_DIR, d))
+        ]
         print(f"  Reports generated: {len(report_targets)} targets")
         for t in report_targets:
-            reports = [f for f in os.listdir(os.path.join(REPORTS_DIR, t)) if f.endswith(".md") and f != "SUMMARY.md"]
+            reports = [
+                f
+                for f in os.listdir(os.path.join(REPORTS_DIR, t))
+                if f.endswith(".md") and f != "SUMMARY.md"
+            ]
             print(f"    - {t}: {len(reports)} reports")
 
     print(f"\n{'='*50}\n")
@@ -380,9 +499,11 @@ def print_dashboard(results):
     for r in results:
         status_icon = f"{GREEN}OK{NC}" if r["success"] else f"{RED}FAIL{NC}"
         print(f"  [{status_icon}] {r['domain']}")
-        print(f"       Recon: {'Done' if r.get('recon') else 'Skipped'} | "
-              f"Scan: {'Done' if r.get('scan') else 'Skipped'} | "
-              f"Reports: {r.get('reports', 0)}")
+        print(
+            f"       Recon: {'Done' if r.get('recon') else 'Skipped'} | "
+            f"Scan: {'Done' if r.get('scan') else 'Skipped'} | "
+            f"Reports: {r.get('reports', 0)}"
+        )
         total_findings += r.get("findings", 0)
         total_reports += r.get("reports", 0)
 
@@ -401,15 +522,20 @@ def print_dashboard(results):
 
 def run_cve_hunt(domain):
     """Run CVE hunter on a target."""
-    log("warn", "cve_hunter.py has been removed. Use /intel in Claude Code for CVE intelligence.")
+    log(
+        "warn",
+        "cve_hunter.py has been removed. Use /intel in Claude Code for CVE intelligence.",
+    )
     return False
 
 
-def run_zero_day_fuzzer(domain, deep=False):
+def run_zero_day_fuzzer(domain, deep=False, user_agent=None):
     """Run zero-day fuzzer on a target."""
     log("info", f"Running zero-day fuzzer on {domain}...")
     script = os.path.join(TOOLS_DIR, "zero_day_fuzzer.py")
     deep_flag = "--deep" if deep else ""
+
+    child_env = _build_child_env(user_agent=user_agent)
 
     # Check if we have recon data with live URLs
     recon_dir = os.path.join(RECON_DIR, domain)
@@ -419,7 +545,7 @@ def run_zero_day_fuzzer(domain, deep=False):
         cmd = f'python3 "{script}" "https://{domain}" {deep_flag}'
 
     try:
-        proc = subprocess.Popen(cmd, shell=True, cwd=BASE_DIR)
+        proc = subprocess.Popen(cmd, shell=True, cwd=BASE_DIR, env=child_env)
         proc.wait(timeout=900)
         return proc.returncode == 0
     except subprocess.TimeoutExpired:
@@ -428,12 +554,27 @@ def run_zero_day_fuzzer(domain, deep=False):
         return False
 
 
-def hunt_target(domain, quick=False, recon_only=False, scan_only=False, cve_hunt=False, zero_day=False):
+def hunt_target(
+    domain,
+    quick=False,
+    recon_only=False,
+    scan_only=False,
+    cve_hunt=False,
+    zero_day=False,
+    vuln_scope=None,
+    user_agent=None,
+):
     """Run the full hunt pipeline on a single target."""
-    result = {"domain": domain, "success": True, "recon": False, "scan": False, "reports": 0}
+    result = {
+        "domain": domain,
+        "success": True,
+        "recon": False,
+        "scan": False,
+        "reports": 0,
+    }
 
     if not scan_only:
-        result["recon"] = run_recon(domain, quick=quick)
+        result["recon"] = run_recon(domain, quick=quick, user_agent=user_agent)
         if not result["recon"]:
             log("warn", f"Recon had issues for {domain}, continuing anyway...")
 
@@ -441,7 +582,9 @@ def hunt_target(domain, quick=False, recon_only=False, scan_only=False, cve_hunt
         return result
 
     check_cicd_results(domain)
-    result["scan"] = run_vuln_scan(domain, quick=quick)
+    result["scan"] = run_vuln_scan(
+        domain, quick=quick, vuln_scope=vuln_scope, user_agent=user_agent
+    )
 
     # CVE hunting (only when explicitly requested)
     if cve_hunt:
@@ -450,7 +593,7 @@ def hunt_target(domain, quick=False, recon_only=False, scan_only=False, cve_hunt
     # Zero-day fuzzing (disabled by default — high false positive rate)
     if zero_day:
         log("warn", "Zero-day fuzzer enabled — results require manual verification")
-        run_zero_day_fuzzer(domain, deep=not quick)
+        run_zero_day_fuzzer(domain, deep=not quick, user_agent=user_agent)
 
     result["reports"] = generate_reports(domain)
 
@@ -469,21 +612,52 @@ Examples:
   python3 hunt.py --quick --target example.com  Quick scan
   python3 hunt.py --status                   Show progress
   python3 hunt.py --setup-wordlists          Download wordlists
-        """
+        """,
     )
-    parser.add_argument("--target", type=str, help="Target: FQDN, IP, or CIDR (e.g. example.com, 192.168.1.1, 10.0.0.0/24)")
-    parser.add_argument("--quick", action="store_true", help="Quick scan mode (fewer checks)")
-    parser.add_argument("--recon-only", action="store_true", help="Only run reconnaissance")
-    parser.add_argument("--scan-only", action="store_true", help="Only run vulnerability scanner")
-    parser.add_argument("--report-only", action="store_true", help="Only generate reports")
+    parser.add_argument(
+        "--target",
+        type=str,
+        help="Target: FQDN, IP, or CIDR (e.g. example.com, 192.168.1.1, 10.0.0.0/24)",
+    )
+    parser.add_argument(
+        "--quick", action="store_true", help="Quick scan mode (fewer checks)"
+    )
+    parser.add_argument(
+        "--recon-only", action="store_true", help="Only run reconnaissance"
+    )
+    parser.add_argument(
+        "--scan-only", action="store_true", help="Only run vulnerability scanner"
+    )
+    parser.add_argument(
+        "--report-only", action="store_true", help="Only generate reports"
+    )
     parser.add_argument("--status", action="store_true", help="Show pipeline status")
-    parser.add_argument("--setup-wordlists", action="store_true", help="Download wordlists")
+    parser.add_argument(
+        "--setup-wordlists", action="store_true", help="Download wordlists"
+    )
     parser.add_argument("--cve-hunt", action="store_true", help="Run CVE hunter")
     parser.add_argument("--zero-day", action="store_true", help="Run zero-day fuzzer")
-    parser.add_argument("--select-targets", action="store_true", help="Only run target selection")
-    parser.add_argument("--top", type=int, default=10, help="Number of targets to select")
-    parser.add_argument("--no-banner", action="store_true",
-                        help="Suppress the startup banner (useful for CI / piped output)")
+    parser.add_argument(
+        "--user-agent",
+        type=str,
+        help="Optional User-Agent header to send during target requests",
+    )
+    parser.add_argument(
+        "--vulns",
+        type=str,
+        help="Comma-separated vuln scopes to hunt only (upload,sqli,xss,ssti,cms,mfa,saml; use all for everything)",
+    )
+    parser.add_argument(
+        "--select-targets", action="store_true", help="Only run target selection"
+    )
+    parser.add_argument(
+        "--top", type=int, default=10, help="Number of targets to select"
+    )
+    parser.add_argument(
+        "--no-banner",
+        action="store_true",
+        help="Suppress the startup banner (useful for CI / piped output)",
+    )
     add_cli_args(parser)
     args = parser.parse_args(argv)
 
@@ -492,6 +666,33 @@ Examples:
     # session_id is consistent across recon, scan, and audit log entries).
     global _AUTH_SESSION
     _AUTH_SESSION = session_from_args(args)
+
+    try:
+        user_agent = _normalize_user_agent(args.user_agent)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if (
+        args.vulns is None
+        and sys.stdin.isatty()
+        and not (
+            args.status
+            or args.setup_wordlists
+            or args.select_targets
+            or args.report_only
+        )
+    ):
+        try:
+            args.vulns = input(
+                "Vulnerability scope (comma-separated, or 'all' for everything): "
+            ).strip()
+        except EOFError:
+            args.vulns = None
+
+    try:
+        vuln_scope = normalize_vuln_scope(args.vulns)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Suppress banner on --status / --setup-wordlists (utility paths that
     # shouldn't print a splash) and when explicitly disabled.
@@ -503,10 +704,10 @@ Examples:
             "Bug Bounty Automation Pipeline",
             target=args.target or "(target selector)",
             steps=[
-                ("Recon",    "subdomain enum, URL crawl, tech fingerprint, CVE sweep"),
-                ("Hunt",     "XSS · SQLi · SSRF · IDOR · auth bypass · LLM probes"),
+                ("Recon", "subdomain enum, URL crawl, tech fingerprint, CVE sweep"),
+                ("Hunt", "XSS · SQLi · SSRF · IDOR · auth bypass · LLM probes"),
                 ("Validate", "7-Question Gate · 4-gate checklist · kill weak findings"),
-                ("Report",   "H1/Bugcrowd/Intigriti template · CVSS 3.1 · PoC + repro"),
+                ("Report", "H1/Bugcrowd/Intigriti template · CVSS 3.1 · PoC + repro"),
             ],
         )
 
@@ -520,15 +721,17 @@ Examples:
         setup_wordlists()
         return
 
-    if not any((
-        args.target,
-        args.recon_only,
-        args.scan_only,
-        args.report_only,
-        args.cve_hunt,
-        args.zero_day,
-        args.select_targets,
-    )):
+    if not any(
+        (
+            args.target,
+            args.recon_only,
+            args.scan_only,
+            args.report_only,
+            args.cve_hunt,
+            args.zero_day,
+            args.select_targets,
+        )
+    ):
         print("\nQuick start:")
         print("  python3 tools/hunt.py --target target.com")
         print("  python3 tools/hunt.py --scan-only --target target.com")
@@ -571,7 +774,9 @@ Examples:
             recon_only=args.recon_only,
             scan_only=args.scan_only,
             cve_hunt=args.cve_hunt,
-            zero_day=args.zero_day
+            zero_day=args.zero_day,
+            vuln_scope=vuln_scope,
+            user_agent=user_agent,
         )
         print_dashboard([result])
         return
@@ -599,11 +804,19 @@ Examples:
 
         # Hunt the primary domain
         primary_domain = domains[0]
-        log("info", f"[{i+1}/{len(targets)}] Hunting: {target.get('name', primary_domain)}")
+        log(
+            "info",
+            f"[{i+1}/{len(targets)}] Hunting: {target.get('name', primary_domain)}",
+        )
         log("info", f"  Domain: {primary_domain}")
         log("info", f"  Program: {target.get('url', 'N/A')}")
 
-        result = hunt_target(primary_domain, quick=args.quick)
+        result = hunt_target(
+            primary_domain,
+            quick=args.quick,
+            vuln_scope=vuln_scope,
+            user_agent=user_agent,
+        )
         results.append(result)
 
     print_dashboard(results)

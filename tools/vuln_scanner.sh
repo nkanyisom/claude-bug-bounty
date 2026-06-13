@@ -3,6 +3,7 @@
 # Bug Bounty Vulnerability Scanner v5 — Verified PoC Generation
 #
 # Usage: ./scanner.sh <recon_dir> [--quick] [--full] [--skip xss,sqli,...]
+#        ./scanner.sh <recon_dir> [--only xss,sqli,...] [--user-agent "..."]
 #
 # UPDATED IN V5:
 #   • Bash 3.2 compatible (macOS)
@@ -39,6 +40,8 @@ RECON_DIR=""
 QUICK_MODE=""
 FULL_MODE=""
 SKIP_CHECKS=""
+ONLY_CHECKS=""
+USER_AGENT="${BBHUNT_USER_AGENT:-}"
 
 while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -46,15 +49,84 @@ while [ "$#" -gt 0 ]; do
         --quick) QUICK_MODE="--quick" ;;
         --full) FULL_MODE="--full" ;;
         --skip) shift; SKIP_CHECKS="${SKIP_CHECKS:-}${SKIP_CHECKS:+,}$1" ;;
+        --only|--vulns) shift; ONLY_CHECKS="${ONLY_CHECKS:-}${ONLY_CHECKS:+,}$1" ;;
+        --user-agent) shift; USER_AGENT="$1" ;;
         *) RECON_DIR="$arg" ;;
     esac
     shift
 done
 
 if [ -z "$RECON_DIR" ] || [ ! -d "$RECON_DIR" ]; then
-    echo "Usage: $0 <recon_dir> [--quick] [--full] [--skip xss,sqli,...]" >&2
+    echo "Usage: $0 <recon_dir> [--quick] [--full] [--skip xss,sqli,...] [--only xss,sqli,...] [--user-agent \"...\"]" >&2
     exit 1
 fi
+
+if [ -z "$ONLY_CHECKS" ] && [ -z "$SKIP_CHECKS" ] && [ -t 0 ]; then
+    printf 'Vulnerability scope (comma-separated, or all for everything): '
+    read -r ONLY_CHECKS
+fi
+
+canonical_scope_name() {
+    local token="${1:-}"
+    token=$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    token="${token//-/_}"
+    case "$token" in
+        upload|uploads|fileupload|file_upload|rce) echo "upload" ;;
+        sqli|sql) echo "sqli" ;;
+        xss) echo "xss" ;;
+        ssti) echo "ssti" ;;
+        cms|wordpress|drupal) echo "cms" ;;
+        mfa|2fa|otp) echo "mfa" ;;
+        saml|sso) echo "saml" ;;
+        all) echo "all" ;;
+        "") echo "" ;;
+        *) echo "__invalid__:$token" ;;
+    esac
+}
+
+normalize_scope_list() {
+    local raw="${1:-}"
+    local normalized=""
+    local token canonical
+
+    while [ -n "$raw" ]; do
+        token="${raw%%,*}"
+        if [ "$raw" = "$token" ]; then
+            raw=""
+        else
+            raw="${raw#*,}"
+        fi
+
+        canonical="$(canonical_scope_name "$token")"
+        case "$canonical" in
+            "") continue ;;
+            all) printf '%s' ""; return 0 ;;
+            __invalid__:* ) log_err "Unsupported vulnerability scope: ${token}"; return 1 ;;
+        esac
+
+        case ",$normalized," in
+            *",$canonical,"*) ;;
+            *) normalized="${normalized:+$normalized,}$canonical" ;;
+        esac
+    done
+
+    printf '%s' "$normalized"
+}
+
+if [ -n "$USER_AGENT" ]; then
+    case "$USER_AGENT" in
+        *$'\r'*|*$'\n'*)
+            log_err "User-Agent cannot contain newlines"
+            exit 1
+            ;;
+    esac
+    _BB_HEADERS_TMP="${BBHUNT_AUTH_HEADERS:-}"
+    _BB_HEADERS_TMP="${_BB_HEADERS_TMP:+$_BB_HEADERS_TMP$'\n'}User-Agent: $USER_AGENT"
+    export BBHUNT_AUTH_HEADERS="$_BB_HEADERS_TMP"
+    unset _BB_HEADERS_TMP
+fi
+
+ONLY_CHECKS="$(normalize_scope_list "$ONLY_CHECKS")" || exit 1
 
 RECON_DIR="$(cd "$RECON_DIR" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -106,7 +178,15 @@ _has_skip() {
     [[ ",$source," == *",$want,"* ]] || [[ ",$source," == *",all,"* ]]
 }
 
-skip_has() { _has_skip "${SKIP_CHECKS:-}" "$1" || { [ "$FULL_MODE" != "--full" ] && _has_skip "xss,lfi,ssti,ssrf,cors,takeover,misconfig,jwt,graphql,smuggling,redirects,idor,auth_bypass,host_header,exposure,cloud,race" "$1"; }; }
+scope_has() { [ -z "$ONLY_CHECKS" ] || _has_skip "$ONLY_CHECKS" "$1"; }
+
+skip_has() {
+    local want="${1:-}"
+    if [ -n "$ONLY_CHECKS" ] && ! scope_has "$want"; then
+        return 0
+    fi
+    _has_skip "${SKIP_CHECKS:-}" "$want" || { [ "$FULL_MODE" != "--full" ] && _has_skip "xss,lfi,ssti,ssrf,cors,takeover,misconfig,jwt,graphql,smuggling,redirects,idor,auth_bypass,host_header,exposure,cloud,race" "$want"; }
+}
 
 unsafe_method_guard() {
     local method="$1"

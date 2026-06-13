@@ -141,6 +141,7 @@ chmod +x install.sh      && ./install.sh          # skills + commands → ~/.cla
 claude
 /recon target.com        # map the attack surface
 /hunt target.com         # test for vulnerabilities
+/hunt target.com --vulns xss,sqli --user-agent "MyReconBot/1.0"  # limit scope and set a custom User-Agent
 /validate                # run the 7-Question Gate
 /report                  # write the submission
 ```
@@ -164,7 +165,7 @@ Verify /recon /hunt /validate /report are available.
 | Command | What It Does |
 |:---|:---|
 | `/recon target.com` | Subdomain enum · live host probing · URL crawl · nuclei sweep |
-| `/hunt target.com` | Tests IDOR · auth bypass · SSRF · XSS · SQLi · logic flaws and more |
+| `/hunt target.com` | Tests IDOR · auth bypass · SSRF · XSS · SQLi · logic flaws and more; supports `--vulns` and `--user-agent` |
 | `/validate` | 7-Question Gate — kills weak findings before you waste time reporting |
 | `/report` | Generates an H1 · Bugcrowd · Intigriti · Immunefi submission in 60s |
 | `/autopilot target.com` | Full loop, autonomous — scope → recon → hunt → validate → report |
@@ -311,7 +312,7 @@ claude-bug-bounty/
 ├── tools/                     # Python + shell scanner pipeline (~35 tools)
 │   ├── hunt.py                # Master orchestrator
 │   ├── recon_engine.sh        # Subdomain + URL discovery
-│   ├── vuln_scanner.sh        # XSS · SQLi · SSRF · SSTI probe pipeline
+│   ├── vuln_scanner.sh        # XSS · SQLi · SSTI · upload/RCE · MFA · CMS · SAML probe pipeline
 │   ├── validate.py            # 4-gate finding validator with identity checks
 │   └── …                      # 30+ more scanners — see tools/README.md
 │
